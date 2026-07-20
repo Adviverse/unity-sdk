@@ -1,0 +1,10 @@
+{
+  "name": "com.adviverse.ads",
+  "version": "0.1.0",
+  "displayName": "Adviverse Ads",
+  "description": "Rewarded + interstitial ads for Unity games. Adviverse serves the ads itself — no third-party ad-network SDK. Mobile, desktop, and WebGL.",
+  "unity": "2020.3",
+  "keywords": ["ads", "rewarded", "interstitial", "monetization", "adviverse"],
+  "author": { "name": "Adviverse", "url": "https://adviverse.com" },
+  "license": "UNLICENSED"
+}
