@@ -7,11 +7,28 @@ using System;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.Video;
+#if (UNITY_WEBGL || UNITY_IOS) && !UNITY_EDITOR
+using System.Runtime.InteropServices;
+#endif
 
 namespace Adviverse
 {
     internal class AdviversePresenter : MonoBehaviour
     {
+#if UNITY_WEBGL && !UNITY_EDITOR
+        // Implemented in Plugins/WebGL/AdviversePlayable.jslib.
+        [DllImport("__Internal")] private static extern void AdviversePlayableOpen(string url, string objName);
+        [DllImport("__Internal")] private static extern void AdviversePlayableClose();
+#elif UNITY_IOS && !UNITY_EDITOR
+        // Implemented in Plugins/iOS/AdviversePlayable.mm (C-ABI, __Internal).
+        [DllImport("__Internal")] private static extern void AdviverseIOSPlayableOpen(string url, string objName, bool rewarded);
+        [DllImport("__Internal")] private static extern void AdviverseIOSPlayableClose();
+#endif
+#if (UNITY_WEBGL || UNITY_IOS || UNITY_ANDROID) && !UNITY_EDITOR
+        // True once a native/DOM webview playable overlay is live (WebGL iframe,
+        // iOS WKWebView, or Android WebView) — so Dismiss tears the right one down.
+        private bool _playableActive;
+#endif
         private MonoBehaviour _host;
         private string _base;
 
@@ -27,6 +44,7 @@ namespace Adviverse
         private bool _completed;
         private bool _closed;
         private bool _impFired;
+        private VastTracker _vast; // non-null when playing a resolved third-party VAST tag
 
         private Action _onReward;
         private Action _onClose;
@@ -41,23 +59,55 @@ namespace Adviverse
             return p;
         }
 
-        public void Play(string format, AdResponse ad, Action onReward, Action onClose, Action<string> onError)
+        public void Play(string format, AdResponse ad, Action onReward, Action onClose, Action<string> onError,
+            VastResult vast = null)
         {
             _ad = ad;
+            if (vast != null) _vast = new VastTracker(_host, vast);
             _rewarded = format == "rewarded";
             _onReward = onReward;
             _onClose = onClose;
             _onError = onError;
 
+            var cr = ad.creative;
+            bool isPlayable = (cr.type ?? "").ToLowerInvariant() == "html5" && !string.IsNullOrEmpty(cr.asset_url);
+            if (isPlayable)
+            {
+                // Playables are HTML5, so they need a browser surface to run in.
+                // WebGL hosts them in a sandboxed iframe over the canvas; iOS in a
+                // WKWebView and Android in a WebView (both via native plugins). On
+                // desktop / console / the editor there is no webview, so we degrade
+                // to the creative's endcard as a normal skippable image ad.
+#if (UNITY_WEBGL || UNITY_IOS || UNITY_ANDROID) && !UNITY_EDITOR
+                PlayPlayable(cr.asset_url);
+                return;
+#else
+                if (string.IsNullOrEmpty(cr.main_image_url))
+                {
+                    // No endcard to fall back to — nothing renderable here.
+                    Fail("playable_no_fallback");
+                    return;
+                }
+                // Fall through to the static-image presentation below, which loads
+                // main_image_url, fires the impression, and runs the skip/close
+                // countdown exactly like any other image interstitial/rewarded.
+#endif
+            }
+
             BuildCanvas();
 
-            var cr = ad.creative;
-            bool isVideo = (cr.type ?? "").ToLowerInvariant() == "video" && !string.IsNullOrEmpty(cr.asset_url);
+            string mediaUrl = _vast != null ? vast.MediaUrl : cr.asset_url;
+            bool isVideo = (cr.type ?? "").ToLowerInvariant() == "video" && !string.IsNullOrEmpty(mediaUrl);
+            float dur = cr.duration > 0 ? cr.duration : (_vast != null ? vast.Duration : 0f);
             float skipAfter = _rewarded
-                ? Mathf.Max(1f, cr.duration > 0 ? cr.duration : (isVideo ? 15f : 5f))
+                ? Mathf.Max(1f, dur > 0 ? dur : (isVideo ? 15f : 5f))
                 : Mathf.Max(1f, cr.skip_offset_sec > 0 ? cr.skip_offset_sec : 5f);
+            // VAST interstitials honour the tag's skipoffset; absent = not
+            // skippable before the media ends (close also unlocks on end).
+            if (_vast != null && !_rewarded)
+                skipAfter = Mathf.Max(1f, vast.SkipOffset >= 0 ? vast.SkipOffset : (dur > 0 ? dur : 15f));
 
-            if (isVideo) PlayVideo(cr.asset_url);
+            if (isVideo) PlayVideo(mediaUrl);
             else _host.StartCoroutine(AdviverseFetch.LoadTexture(
                 string.IsNullOrEmpty(cr.main_image_url) ? cr.asset_url : cr.main_image_url,
                 (tex) =>
@@ -100,7 +150,7 @@ namespace Adviverse
 
             // "Ad" disclosure label (top-left).
             var label = MakeText("label", "AD", 26, TextAnchor.MiddleLeft);
-            Anchor(label, new Vector2(0, 1), new Vector2(24, -24), new Vector2(160, 44));
+            Anchor(label.gameObject, new Vector2(0, 1), new Vector2(24, -24), new Vector2(160, 44));
 
             // Countdown (top-right).
             _timerText = MakeText("timer", "", 30, TextAnchor.MiddleRight);
@@ -145,10 +195,39 @@ namespace Adviverse
             _video.targetTexture = _rt;
             _video.audioOutputMode = VideoAudioOutputMode.Direct;
             _video.isLooping = false;
-            _video.prepareCompleted += (vp) => { FireImpression(); vp.Play(); };
-            _video.loopPointReached += (vp) => { _completed = true; ShowClose(); };
-            _video.errorReceived += (vp, msg) => Fail("video_error");
+            _video.prepareCompleted += (vp) =>
+            {
+                FireImpression();
+                vp.Play();
+                _vast?.Started();
+            };
+            _video.loopPointReached += (vp) =>
+            {
+                _completed = true;
+                _vast?.Fire("complete");
+                ShowClose();
+            };
+            _video.errorReceived += (vp, msg) =>
+            {
+                if (_vast != null)
+                {
+                    // Media failure on a VAST tag: chain Error URLs + ours, then
+                    // a no-fill (no reward — Dismiss never grants).
+                    int code = _impFired ? VastErrorCode.MediaPlay : VastErrorCode.MediaNotFound;
+                    AdviverseVast.ReportError(_host, _base, _ad, _vast.Result, code);
+                    Fail("no_fill");
+                    return;
+                }
+                Fail("video_error");
+            };
             _video.Prepare();
+        }
+
+        // Quartile tracking for third-party VAST (our own beacons are unchanged).
+        private void Update()
+        {
+            if (_vast == null || _video == null || _closed || !_video.isPlaying) return;
+            _vast.Progress(_video.time, _video.length);
         }
 
         // ---- flow ----
@@ -173,6 +252,73 @@ namespace Adviverse
             _closeBtn.gameObject.SetActive(true);
         }
 
+        // ---- native/DOM playable (interactive HTML5) ----
+
+#if (UNITY_WEBGL || UNITY_IOS || UNITY_ANDROID) && !UNITY_EDITOR
+        private void PlayPlayable(string url)
+        {
+            _playableActive = true;
+            // Every playable bridge (WebGL .jslib, iOS .mm, Android shim) posts its
+            // lifecycle messages back to this exact GameObject via
+            // (Unity)SendMessage(name, "OnPlayableMessage", type), so the name must
+            // be stable and unique for the duration of the ad.
+            gameObject.name = "AdviversePlayable_" + GetInstanceID();
+#if UNITY_WEBGL && !UNITY_EDITOR
+            AdviversePlayableOpen(url, gameObject.name);
+#elif UNITY_IOS && !UNITY_EDITOR
+            AdviverseIOSPlayableOpen(url, gameObject.name, _rewarded);
+#elif UNITY_ANDROID && !UNITY_EDITOR
+            OpenAndroidPlayable(url, gameObject.name, _rewarded);
+#endif
+        }
+#endif
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        // Full-screen WebView playable, presented by the Java shim under
+        // Plugins/Android (com.adviverse.unity.AdviversePlayableView). It adds an
+        // overlay to the current Unity activity and bridges the same ready / click
+        // / finish / close messages back via UnityPlayer.UnitySendMessage.
+        private static void OpenAndroidPlayable(string url, string objName, bool rewarded)
+        {
+            using (var cls = new AndroidJavaClass("com.adviverse.unity.AdviversePlayableView"))
+            {
+                cls.CallStatic("open", url, objName, rewarded);
+            }
+        }
+
+        private static void CloseAndroidPlayable()
+        {
+            using (var cls = new AndroidJavaClass("com.adviverse.unity.AdviversePlayableView"))
+            {
+                cls.CallStatic("close");
+            }
+        }
+#endif
+
+        // Invoked by the WebGL .jslib, the iOS .mm, or the Android shim via
+        // (Unity)SendMessage — maps the sandboxed playable's lifecycle messages
+        // onto the same impression / click / reward as every other format. A
+        // 'finish' marks the experience complete so a rewarded close then verifies
+        // and grants the reward, exactly like the WebGL path always has.
+        public void OnPlayableMessage(string type)
+        {
+            switch (type)
+            {
+                case "ready":
+                    FireImpression();
+                    break;
+                case "click":
+                    OpenClick();
+                    break;
+                case "finish":
+                    _completed = true;
+                    break;
+                case "close":
+                    OnClosePressed();
+                    break;
+            }
+        }
+
         private void FireImpression()
         {
             if (_impFired) return;
@@ -182,12 +328,27 @@ namespace Adviverse
 
         private void OpenClick()
         {
+            // VAST: open the advertiser's ClickThrough and record OUR click via
+            // /click?track=1 (pixel, no redirect) + the chain's ClickTracking.
+            if (_vast != null && !string.IsNullOrEmpty(_vast.Result.ClickThrough))
+            {
+                if (!string.IsNullOrEmpty(_ad.click_url))
+                    _host.StartCoroutine(AdviverseVast.Get(_base + _ad.click_url + "&track=1"));
+                _vast.Clicked();
+                Application.OpenURL(_vast.Result.ClickThrough);
+                return;
+            }
             if (!string.IsNullOrEmpty(_ad.click_url))
                 Application.OpenURL(_base + _ad.click_url);
         }
 
         private void OnClosePressed()
         {
+            if (_vast != null)
+            {
+                if (!_completed) _vast.Fire("skip");
+                _vast.Fire("closeLinear");
+            }
             if (_rewarded && _completed && !string.IsNullOrEmpty(_ad.reward_url))
             {
                 _host.StartCoroutine(AdviverseFetch.ConfirmReward(_ad.reward_url, (granted) =>
@@ -216,6 +377,13 @@ namespace Adviverse
             var cb = _onClose;
             if (_video != null) _video.Stop();
             if (_rt != null) _rt.Release();
+#if UNITY_WEBGL && !UNITY_EDITOR
+            if (_playableActive) AdviversePlayableClose();
+#elif UNITY_IOS && !UNITY_EDITOR
+            if (_playableActive) AdviverseIOSPlayableClose();
+#elif UNITY_ANDROID && !UNITY_EDITOR
+            if (_playableActive) CloseAndroidPlayable();
+#endif
             _onClose = null;
             Destroy(gameObject);
             cb?.Invoke();

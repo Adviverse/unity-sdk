@@ -32,6 +32,7 @@ namespace Adviverse
         public string brand_name;
         public float duration;
         public float skip_offset_sec;
+        public string vast_tag_url; // third-party VAST tag (resolved when asset_url is empty)
     }
 
     [Serializable]
@@ -136,22 +137,46 @@ namespace Adviverse
             StartCoroutine(AdviverseFetch.Run(this, _base, _client, _uid, format, tag,
                 onAd: (ad) =>
                 {
-                    var presenter = AdviversePresenter.Create(this, _base);
-                    presenter.Play(format, ad, onReward, () =>
+                    if (!AdviverseVast.IsWrapper(ad.creative))
                     {
-                        _busy = false;
-                        onClose?.Invoke();
-                    }, (err) =>
+                        Present(format, ad, null, onReward, onClose, onError);
+                        return;
+                    }
+                    // Third-party VAST tag: resolve to a playable MediaFile first.
+                    // Failure fires the chain's Error URLs + ours and is a no-fill,
+                    // so the ad never shows and a rewarded one can never grant.
+                    StartCoroutine(AdviverseVast.Resolve(ad.creative.vast_tag_url, (code, res) =>
                     {
-                        _busy = false;
-                        onError?.Invoke(err);
-                    });
+                        if (code != 0)
+                        {
+                            AdviverseVast.ReportError(this, _base, ad, res, code);
+                            _busy = false;
+                            onError?.Invoke("no_fill");
+                            return;
+                        }
+                        Present(format, ad, res, onReward, onClose, onError);
+                    }));
                 },
                 onError: (err) =>
                 {
                     _busy = false;
                     onError?.Invoke(err);
                 }));
+        }
+
+        private void Present(string format, AdResponse ad, VastResult vast, Action onReward, Action onClose,
+            Action<string> onError)
+        {
+            var presenter = AdviversePresenter.Create(this, _base);
+            presenter.Play(format, ad, onReward, () =>
+            {
+                _busy = false;
+                onClose?.Invoke();
+            }, (err) =>
+            {
+                _busy = false;
+                onError?.Invoke(err);
+            }, vast);
         }
 
         internal string Base => _base;

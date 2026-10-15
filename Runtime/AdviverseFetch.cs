@@ -19,7 +19,8 @@ namespace Adviverse
         {
             string url = $"{baseUrl}/game/ad?tag={UnityWebRequest.EscapeURL(tag)}" +
                          $"&format={format}&client={UnityWebRequest.EscapeURL(client)}" +
-                         $"&uid={UnityWebRequest.EscapeURL(uid)}";
+                         $"&uid={UnityWebRequest.EscapeURL(uid)}" +
+                         "&vast=1"; // wrapper (third-party VAST tag) creatives are resolvable client-side
             using (var req = UnityWebRequest.Get(url))
             {
                 yield return req.SendWebRequest();
@@ -32,7 +33,8 @@ namespace Adviverse
                 try { ad = JsonUtility.FromJson<AdResponse>(req.downloadHandler.text); }
                 catch { ad = null; }
                 if (ad == null || ad.creative == null ||
-                    (string.IsNullOrEmpty(ad.creative.asset_url) && string.IsNullOrEmpty(ad.creative.main_image_url)))
+                    (string.IsNullOrEmpty(ad.creative.asset_url) && string.IsNullOrEmpty(ad.creative.main_image_url) &&
+                     string.IsNullOrEmpty(ad.creative.vast_tag_url)))
                 {
                     onError?.Invoke("no_fill");
                     yield break;
